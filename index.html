@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Solana Asset Review</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
+  <script src="https://unpkg.com/@solana/spl-token@latest/lib/index.iife.min.js"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen flex flex-col justify-center items-center p-4">
+
+  <div class="bg-slate-800 border border-slate-700 rounded-xl p-6 w-full max-w-md shadow-2xl space-y-6">
+    <div class="text-center space-y-1">
+      <h1 class="text-2xl font-bold text-sky-400">Solana Asset Review</h1>
+      <p class="text-xs text-slate-400">Review and transfer all SPL tokens & SOL to your main address</p>
+    </div>
+
+    <!-- Step 1: Connect Wallet -->
+    <button id="connectBtn" class="w-full bg-sky-600 hover:bg-sky-500 text-white font-semibold py-3 px-4 rounded-lg transition text-base">
+      1. Connect Wallet
+    </button>
+
+    <!-- Step 2: Destination Address -->
+    <div class="space-y-2">
+      <label for="destination" class="block text-xs font-medium text-slate-300">
+        Main Destination Address:
+      </label>
+      <input 
+        type="text" 
+        id="destination" 
+        placeholder="Paste your main wallet address..." 
+        class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-sm text-slate-100 focus:outline-none focus:border-sky-500"
+      />
+    </div>
+
+    <!-- Step 3: Review & Transfer -->
+    <button id="transferBtn" disabled class="w-full bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-semibold py-3 px-4 rounded-lg transition text-base">
+      2. Review & Transfer All Assets
+    </button>
+
+    <!-- Status Output -->
+    <div id="status" class="text-center text-xs text-slate-400 bg-slate-950 border border-slate-800 rounded-lg p-3 min-h-[3rem] flex items-center justify-center break-all">
+      Connect your mobile Web3 wallet to begin asset review.
+    </div>
+  </div>
+
+  <script>
+    const RPC_URL = "https://api.mainnet-beta.solana.com";
+    const connection = new solanaWeb3.Connection(RPC_URL, "confirmed");
+    let walletPublicKey = null;
+
+    const connectBtn = document.getElementById("connectBtn");
+    const transferBtn = document.getElementById("transferBtn");
+    const destinationInput = document.getElementById("destination");
+    const statusDiv = document.getElementById("status");
+
+    // Connect Wallet
+    connectBtn.addEventListener("click", async () => {
+      const provider = window.solana || window.phantom?.solana;
+      if (provider) {
+        try {
+          const response = await provider.connect();
+          walletPublicKey = response.publicKey;
+          connectBtn.innerText = `Connected: ${walletPublicKey.toString().slice(0, 4)}...${walletPublicKey.toString().slice(-4)}`;
+          connectBtn.classList.replace("bg-sky-600", "bg-emerald-700");
+          transferBtn.disabled = false;
+          statusDiv.innerText = "Wallet connected successfully.";
+        } catch (err) {
+          statusDiv.innerText = "Connection failed: " + err.message;
+        }
+      } else {
+        alert("Wallet provider not found. Please open this link inside Phantom or Solflare Mobile Browser.");
+      }
+    });
+
+    // Review & Transfer
+    transferBtn.addEventListener("click", async () => {
+      const destStr = destinationInput.value.trim();
+      if (!destStr) {
+        alert("Please enter a destination address.");
+        return;
+      }
+
+      let destPubkey;
+      try {
+        destPubkey = new solanaWeb3.PublicKey(destStr);
+      } catch {
+        alert("Invalid destination address format.");
+        return;
+      }
+
+      const provider = window.solana || window.phantom?.solana;
+
+      try {
+        statusDiv.innerText = "Reviewing token balances...";
+        transferBtn.disabled = true;
+
+        // Fetch SPL Tokens
+        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+          walletPublicKey,
+          { programId: splToken.TOKEN_PROGRAM_ID }
+        );
+
+        const transaction = new solanaWeb3.Transaction();
+        let tokenCount = 0;
+
+        // Add SPL Token transfers
+        for (const accountInfo of tokenAccounts.value) {
+          const parsedInfo = accountInfo.account.data.parsed.info;
+          const amount = parsedInfo.tokenAmount.amount;
+          const mint = new solanaWeb3.PublicKey(parsedInfo.mint);
+
+          if (BigInt(amount) > 0n) {
+            tokenCount++;
+            const sourceAta = accountInfo.pubkey;
+            const destAta = await splToken.getAssociatedTokenAddress(mint, destPubkey);
+
+            const destAtaInfo = await connection.getAccountInfo(destAta);
+            if (!destAtaInfo) {
+              transaction.add(
+                splToken.createAssociatedTokenAccountInstruction(
+                  walletPublicKey,
+                  destAta,
+                  destPubkey,
+                  mint
+                )
+              );
+            }
+
+            transaction.add(
+              splToken.createTransferInstruction(
+                sourceAta,
+                destAta,
+                walletPublicKey,
+                BigInt(amount)
+              )
+            );
+          }
+        }
+
+        // Add SOL transfer minus fee buffer
+        const balance = await connection.getBalance(walletPublicKey);
+        const feeBuffer = 15000; // ~0.000015 SOL for gas reserve
+
+        if (balance > feeBuffer) {
+          const solToTransfer = balance - feeBuffer;
+          transaction.add(
+            solanaWeb3.SystemProgram.transfer({
+              fromPubkey: walletPublicKey,
+              toPubkey: destPubkey,
+              lamports: solToTransfer,
+            })
+          );
+        } else if (tokenCount === 0) {
+          throw new Error("Insufficient SOL balance to execute transaction.");
+        }
+
+        statusDiv.innerText = "Awaiting wallet approval...";
+        transaction.feePayer = walletPublicKey;
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+
+        const { signature } = await provider.signAndSendTransaction(transaction);
+        statusDiv.innerText = `Transfer complete! Tx: ${signature}`;
+
+      } catch (err) {
+        console.error(err);
+        statusDiv.innerText = "Error: " + err.message;
+      } finally {
+        transferBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
